@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.6 (2026-10-09)
+
+### Added — second round from the Karpathy thread
+
+- **Retrieval-clipping visibility** — every answer now reports how much of
+  the retrieved text actually reached the model (`read 3 pages · 9.1k of
+  14.2k chars fit · clipped: …`). A page that was found but silently cut
+  by the context budget is no longer invisible.
+- **Queries are logged** — `logs/<date>.md` gets a line per ask (`query |
+  "…" read=N cited=M sent=S/R chars read: …`), so the log now covers all
+  three operations as the pattern specifies, and read-but-uncited pages
+  are greppable.
+- **Three more findings computed in code** — `broken citation` (a page
+  cites a source file that was moved or deleted), `broken link` (a
+  `[[wikilink]]` with no page or note behind it), `near duplicate` (two
+  research pages whose names are the same concept — extend, don't
+  create). The model is told not to guess at any of these.
+- **Fail-open contribute** — if the model call fails after your text was
+  saved to the daily file, the error says exactly where it is.
+
 ## 0.4.5 (2026-09-13)
 
 ### Added — wiki integrity (ideas from the Karpathy LLM-wiki thread)
