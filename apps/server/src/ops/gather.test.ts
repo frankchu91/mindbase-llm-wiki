@@ -3,7 +3,10 @@ import { mkdtemp, mkdir, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { gatherProjectCore, gatherUnbuiltSources, gatherResearchPages, gatherSourceStats, listResearchSlugs, parseCitations } from './gather';
+import {
+  findMissingFiles, gatherProjectCore, gatherUnbuiltSources, gatherResearchPages, gatherSourceStats,
+  listNoteSlugs, listResearchSlugs, parseCitations,
+} from './gather';
 import { completeJson } from './llm';
 import type { ChatChunk, ChatMessage } from '@mindbase/core';
 
@@ -84,6 +87,31 @@ describe('listResearchSlugs', () => {
     await touch('sources/research/notes.txt', 'nope', 1000);
     await mkdir(join(root, 'sources', 'research', 'subdir'), { recursive: true });
     expect((await listResearchSlugs(root)).sort()).toEqual(['b', 'deep-work']);
+  });
+});
+
+describe('listNoteSlugs', () => {
+  it('returns note basenames across contributors, ignoring daily files, non-md and nested dirs', async () => {
+    expect(await listNoteSlugs(root)).toEqual([]);
+    await touch('sources/contributors/u/2026-01-01.md', 'daily, not a note', 1000);
+    await touch('sources/contributors/u/notes/deep-work.md', '# DW', 1000);
+    await touch('sources/contributors/u/notes/scratch.txt', 'nope', 1000);
+    await touch('sources/contributors/v/notes/Attention_Span.md', '# AS', 1000);
+    await mkdir(join(root, 'sources', 'contributors', 'v', 'notes', 'sub'), { recursive: true });
+    expect((await listNoteSlugs(root)).sort()).toEqual(['Attention_Span', 'deep-work']);
+  });
+});
+
+describe('findMissingFiles', () => {
+  it('returns the paths that are not regular files', async () => {
+    await touch('sources/contributors/u/here.md', 'x', 1000);
+    const missing = await findMissingFiles(root, [
+      'sources/contributors/u/here.md',
+      'sources/contributors/u/gone.md',
+      'sources/contributors', // a directory is not a citable file
+      'sources/contributors/u/gone.md', // duplicates collapse
+    ]);
+    expect([...missing].sort()).toEqual(['sources/contributors', 'sources/contributors/u/gone.md']);
   });
 });
 

@@ -43,8 +43,27 @@ export type QAEvent =
       citations: Array<{ path: string; title: string }>;
       sources: CitedSource[];
       usage: { input_tokens: number; output_tokens: number };
+      budget: RetrievalBudget;
     }
   | { kind: 'error'; error: string };
+
+/**
+ * How much of the retrieved text actually reached the model. Without this a
+ * page can be silently clipped or dropped and the model answers "no
+ * information" while the pipeline held the answer.
+ */
+export interface RetrievalBudget {
+  /** Sum of full body lengths loaded for the prompt, before any truncation. */
+  retrievedChars: number;
+  /** Characters actually placed into source blocks. */
+  sentChars: number;
+  /**
+   * Project-relative paths (notes: candidate path; raw sources: `raw:<id>`)
+   * whose body was truncated or dropped because the budget ran out.
+   * De-duplicated, in encounter order.
+   */
+  clipped: string[];
+}
 
 const READ_FILE_TOOL = {
   name: 'read_file',
@@ -183,6 +202,14 @@ export async function* askQuestion(opts: AskOptions): AsyncIterable<QAEvent> {
   let usedChars = 0;
   const sourceBlocks: string[] = [];
 
+  // Budget accounting — surfaced on the `done` event so the UI/log can show
+  // how much of what we retrieved the model actually saw.
+  let retrievedChars = 0;
+  const clipped: string[] = [];
+  const markClipped = (p: string): void => {
+    if (!clipped.includes(p)) clipped.push(p);
+  };
+
   // Helper: find raw file by ID across all date dirs
   async function findRawContent(rawId: string): Promise<string | null> {
     const rawEntries = await store.listDir('raw');
@@ -211,22 +238,34 @@ export async function* askQuestion(opts: AskOptions): AsyncIterable<QAEvent> {
   if (recentRawIds.length > 0) {
     for (const rawId of recentRawIds.slice(-2)) {
       const rawText = await findRawContent(rawId);
-      if (rawText && usedChars + rawText.length < MAX_SOURCE_CHARS) {
+      if (!rawText) continue;
+      retrievedChars += rawText.length;
+      if (usedChars + rawText.length < MAX_SOURCE_CHARS) {
         const truncated = rawText.slice(0, MAX_SOURCE_CHARS - usedChars);
         sourceBlocks.push(`--- Raw Source (from this conversation): ${rawId} ---\n${truncated}`);
         usedChars += truncated.length;
+        if (truncated.length < rawText.length) markClipped(`raw:${rawId}`);
+      } else {
+        markClipped(`raw:${rawId}`);
       }
     }
   }
 
-  // TIER 2: Load wiki notes + their raw sources (if we have budget left)
+  // TIER 2: Load wiki notes + their raw sources. Bodies are read even once
+  // the budget is exhausted so retrievedChars/clipped reflect what was dropped.
   for (const cand of numberedSources.slice(0, 3)) {
-    if (usedChars >= MAX_SOURCE_CHARS) break;
     try {
       const noteBody = await store.readText(cand.path);
-      const noteTruncated = noteBody.slice(0, Math.min(3000, MAX_SOURCE_CHARS - usedChars));
+      retrievedChars += noteBody.length;
+      const remaining = MAX_SOURCE_CHARS - usedChars;
+      if (remaining <= 0) {
+        markClipped(cand.path);
+        continue;
+      }
+      const noteTruncated = noteBody.slice(0, Math.min(3000, remaining));
       sourceBlocks.push(`--- [${cand.layer}] ${cand.title} ---\n${noteTruncated}`);
       usedChars += noteTruncated.length;
+      if (noteTruncated.length < noteBody.length) markClipped(cand.path);
 
       // TIER 3: Load raw sources referenced by this wiki note
       if (usedChars < MAX_SOURCE_CHARS) {
@@ -236,16 +275,23 @@ export async function* askQuestion(opts: AskOptions): AsyncIterable<QAEvent> {
           for (const rawId of (meta.sources ?? []).slice(0, 1)) {
             if (recentRawIds.includes(rawId)) continue; // already loaded in tier 1
             const rawText = await findRawContent(rawId);
-            if (rawText && usedChars + 2000 < MAX_SOURCE_CHARS) {
+            if (!rawText) continue;
+            retrievedChars += rawText.length;
+            if (usedChars + 2000 < MAX_SOURCE_CHARS) {
               const truncated = rawText.slice(0, Math.min(3000, MAX_SOURCE_CHARS - usedChars));
               sourceBlocks.push(`--- Raw Source: ${rawId} ---\n${truncated}`);
               usedChars += truncated.length;
+              if (truncated.length < rawText.length) markClipped(`raw:${rawId}`);
+            } else {
+              markClipped(`raw:${rawId}`);
             }
           }
         } catch { /* no meta */ }
       }
     } catch { /* skip */ }
   }
+
+  const budget: RetrievalBudget = { retrievedChars, sentChars: usedChars, clipped };
 
   const fullContentStr = sourceBlocks.length > 0
     ? '\n\n' + sourceBlocks.join('\n\n')
@@ -314,7 +360,7 @@ export async function* askQuestion(opts: AskOptions): AsyncIterable<QAEvent> {
     if (sawError) return;
 
     if (pendingCalls.length === 0) {
-      yield { kind: 'done', citations: readFiles, sources: numberedSources, usage: totalUsage };
+      yield { kind: 'done', citations: readFiles, sources: numberedSources, usage: totalUsage, budget };
       return;
     }
 
@@ -355,5 +401,5 @@ export async function* askQuestion(opts: AskOptions): AsyncIterable<QAEvent> {
     }
   }
 
-  yield { kind: 'done', citations: readFiles, sources: numberedSources, usage: totalUsage };
+  yield { kind: 'done', citations: readFiles, sources: numberedSources, usage: totalUsage, budget };
 }

@@ -38,7 +38,7 @@ export { applySectionPatch } from './compile/patches';
 export type { SectionPatch, PatchResult } from './compile/patches';
 export { COMPILE_V2_SYSTEM_PROMPT, buildL1MessagesV2 } from './compile/prompts';
 export { askQuestion } from './qa/query';
-export type { QAEvent } from './qa/query';
+export type { QAEvent, RetrievalBudget } from './qa/query';
 export { runCrosslinker } from './compile/crosslink';
 export type { CrosslinkResult } from './compile/crosslink';
 

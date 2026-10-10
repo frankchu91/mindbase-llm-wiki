@@ -96,6 +96,36 @@ export async function listResearchSlugs(root: string): Promise<string[]> {
   return entries.filter((e) => e.isFile() && e.name.endsWith('.md')).map((e) => e.name.replace(/\.md$/, ''));
 }
 
+/**
+ * Slugs of every contributor note (`sources/contributors/<user>/notes/*.md`,
+ * basename without `.md`) across all contributors. Together with
+ * `listResearchSlugs` this is the full set of `[[wikilink]]` targets that
+ * resolve, so lint can flag the ones that don't.
+ */
+export async function listNoteSlugs(root: string): Promise<string[]> {
+  const base = join(root, 'sources', 'contributors');
+  const users = (await readdir(base, { withFileTypes: true }).catch(() => [])).filter((e) => e.isDirectory());
+  const perUser = await Promise.all(
+    users.map(async (u) => {
+      const entries = await readdir(join(base, u.name, 'notes'), { withFileTypes: true }).catch(() => []);
+      return entries.filter((e) => e.isFile() && e.name.endsWith('.md')).map((e) => e.name.replace(/\.md$/, ''));
+    }),
+  );
+  return perUser.flat();
+}
+
+/**
+ * The subset of project-relative paths that are NOT regular files on disk —
+ * one `stat` per unique path. Feeds the lint `broken_citation` check.
+ */
+export async function findMissingFiles(root: string, rels: Iterable<string>): Promise<Set<string>> {
+  const unique = [...new Set(rels)];
+  const present = await Promise.all(
+    unique.map((rel) => stat(join(root, rel)).then((s) => s.isFile()).catch(() => false)),
+  );
+  return new Set(unique.filter((_, i) => !present[i]));
+}
+
 export interface SourceStat {
   path: string;
   /** Citations from research pages + context.md pointing at this source. */

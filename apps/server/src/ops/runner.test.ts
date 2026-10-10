@@ -301,7 +301,9 @@ describe('lint', () => {
   });
 
   it('emits findings, caches artifact, logs — and never writes wiki files', async () => {
-    // Cited so the deterministic unsourced_page check stays quiet here.
+    // Cited (and the cited file exists) so the deterministic unsourced_page /
+    // broken_citation checks stay quiet here.
+    await writeFile(join(root, 'sources', 'contributors', 'u', 'x.md'), 'source', 'utf-8');
     await writeFile(join(root, 'sources', 'research', 'lonely.md'), '# Lonely\n\nno links here [@sources/contributors/u/x.md]', 'utf-8');
     const contextBefore = await readFile(join(root, 'context.md'), 'utf-8');
     const c = collect();
@@ -341,6 +343,7 @@ describe('lint evidence verification', () => {
   const CITE = '[@sources/contributors/u/2026-01-01.md]';
 
   async function twoPages() {
+    await writeFile(join(root, 'sources', 'contributors', 'u', '2026-01-01.md'), 'source', 'utf-8');
     await writeFile(join(root, 'sources', 'research', 'a.md'), `# A\n\nThe launch is scheduled for **March 2027**. ${CITE}\n`, 'utf-8');
     await writeFile(join(root, 'sources', 'research', 'b.md'), `# B\n\nThe launch is scheduled for June 2027, per the CEO. ${CITE}\n`, 'utf-8');
   }
@@ -438,6 +441,7 @@ describe('lint deterministic findings', () => {
   const dayAgo = Math.floor(Date.now() / 1000) - 86_400;
 
   it('(e) research page without citations → unsourced_page, after model findings', async () => {
+    await writeFile(join(root, 'sources', 'contributors', 'u', '2026-01-01.md'), 'source', 'utf-8');
     await writeFile(join(root, 'sources', 'research', 'sourced.md'), '# S\n\nclaim [@sources/contributors/u/2026-01-01.md]\n', 'utf-8');
     await writeFile(join(root, 'sources', 'research', 'bare.md'), '# Bare\n\nno citations at all\n', 'utf-8');
     const out = JSON.stringify({ findings: [{ kind: 'orphan', pages: ['sources/research/bare.md'], detail: 'Nothing links here.' }] });
@@ -484,5 +488,110 @@ describe('lint deterministic findings', () => {
     const ev = c.events.find((e) => e.kind === 'findings');
     const f = ev && ev.kind === 'findings' ? ev.findings : [];
     expect(f.some((x) => x.kind === 'uncited_source')).toBe(false);
+  });
+
+  const lintFindings = async (modelOut: string = noFindings): Promise<StoredFinding[]> => {
+    const c = collect();
+    await runLint(scriptedCtx([modelOut]), c.emit);
+    const ev = c.events.find((e) => e.kind === 'findings');
+    return ev && ev.kind === 'findings' ? ev.findings : [];
+  };
+
+  it('(g) citing a file that does not exist → broken_citation naming that path; existing file → none', async () => {
+    await writeFile(join(root, 'sources', 'contributors', 'u', 'here.md'), 'present', 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'ok.md'), '# OK\n\n[@sources/contributors/u/here.md]\n', 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'dangling.md'), '# D\n\n[@sources/contributors/u/here.md] [@sources/contributors/u/gone.md]\n', 'utf-8');
+    const broken = (await lintFindings()).filter((x) => x.kind === 'broken_citation');
+    expect(broken).toHaveLength(1);
+    expect(broken[0]!.pages).toEqual(['sources/research/dangling.md']);
+    expect(broken[0]!.detail).toBe('Cites [@sources/contributors/u/gone.md] but that file no longer exists (moved or deleted). Update the citation.');
+  });
+
+  it('(g2) context.md citing a missing file → broken_citation on context.md', async () => {
+    await writeFile(join(root, 'context.md'), '# T — Context\n\n- fact [@sources/raw/2026-01-01/x.extracted.md]\n', 'utf-8');
+    const broken = (await lintFindings()).filter((x) => x.kind === 'broken_citation');
+    expect(broken.map((x) => x.pages)).toEqual([['context.md']]);
+    expect(broken[0]!.detail).toContain('[@sources/raw/2026-01-01/x.extracted.md]');
+  });
+
+  it('(h) [[nope]] → broken_link; [[Deep_Work]] resolving to a contributor note is fine', async () => {
+    await mkdir(join(root, 'sources', 'contributors', 'u', 'notes'), { recursive: true });
+    await writeFile(join(root, 'sources', 'contributors', 'u', 'notes', 'deep-work.md'), '# Deep Work', 'utf-8');
+    await writeFile(join(root, 'sources', 'contributors', 'u', 'src.md'), 's', 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'focus.md'), '# Focus\n\nSee [[Deep_Work]] and [[nope]]. [@sources/contributors/u/src.md]\n', 'utf-8');
+    const broken = (await lintFindings()).filter((x) => x.kind === 'broken_link');
+    expect(broken).toHaveLength(1);
+    expect(broken[0]!.pages).toEqual(['sources/research/focus.md']);
+    expect(broken[0]!.detail).toBe('Links to [[nope]] but no page or note with that name exists. Create it or fix the link.');
+  });
+
+  it('(h2) a wikilink to another research page (any casing/separator) is not broken', async () => {
+    await writeFile(join(root, 'sources', 'contributors', 'u', 'src.md'), 's', 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'deep-work.md'), '# DW\n\n[@sources/contributors/u/src.md]\n', 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'focus.md'), '# Focus\n\n[[Deep Work]] [@sources/contributors/u/src.md]\n', 'utf-8');
+    expect((await lintFindings()).filter((x) => x.kind === 'broken_link')).toEqual([]);
+  });
+
+  it('(i) near-identical slugs → one near_duplicate pair; unrelated slugs → none', async () => {
+    await writeFile(join(root, 'sources', 'contributors', 'u', 'src.md'), 's', 'utf-8');
+    const page = (slug: string) =>
+      writeFile(join(root, 'sources', 'research', `${slug}.md`), `# ${slug}\n\n[@sources/contributors/u/src.md]\n`, 'utf-8');
+    await Promise.all(['attention-residue-cost', 'attention-residue-costs-explained', 'deep-work', 'attention-span'].map(page));
+    const dups = (await lintFindings()).filter((x) => x.kind === 'near_duplicate');
+    expect(dups).toHaveLength(1);
+    expect([...dups[0]!.pages].sort()).toEqual([
+      'sources/research/attention-residue-cost.md',
+      'sources/research/attention-residue-costs-explained.md',
+    ]);
+    expect(dups[0]!.detail).toMatch(/^"attention-residue-costs?(-explained)?" and "attention-residue-costs?(-explained)?" look like the same concept\. Extend one page instead of keeping both\.$/);
+  });
+
+  it('deterministic kinds are emitted after model kinds, in the documented order', async () => {
+    await mkdir(join(root, 'sources', 'contributors', 'u', 'notes'), { recursive: true });
+    await writeFile(join(root, 'sources', 'research', 'alpha-beta.md'), '# AB\n\n[[nowhere]] [@sources/contributors/u/missing.md]\n', 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'alpha-betas.md'), '# AB2\n\nno cites\n', 'utf-8');
+    const out = JSON.stringify({ findings: [{ kind: 'question', pages: ['context.md'], detail: 'Why?' }] });
+    const kinds = (await lintFindings(out)).map((x) => x.kind);
+    expect(kinds).toEqual(['question', 'unsourced_page', 'broken_citation', 'broken_link', 'near_duplicate']);
+  });
+
+  it('a model-emitted broken_link (or other deterministic kind) is dropped by runLint', async () => {
+    await writeFile(join(root, 'sources', 'contributors', 'u', 'src.md'), 's', 'utf-8');
+    await writeFile(join(root, 'sources', 'research', 'clean.md'), '# Clean\n\n[@sources/contributors/u/src.md]\n', 'utf-8');
+    const out = JSON.stringify({ findings: [
+      { kind: 'broken_link', pages: ['sources/research/clean.md'], detail: 'Model thinks a link is broken.' },
+      { kind: 'near_duplicate', pages: ['sources/research/clean.md'], detail: 'Model thinks this is a dup.' },
+      { kind: 'broken_citation', pages: ['sources/research/clean.md'], detail: 'Model thinks a citation is broken.' },
+      { kind: 'gap', pages: ['sources/research/clean.md'], detail: 'A real gap.' },
+    ] });
+    const f = await lintFindings(out);
+    expect(f.map((x) => x.kind)).toEqual(['gap']);
+  });
+});
+
+describe('contribute: fail-open when the plan fails after the entry was saved', () => {
+  const throwingCtx = (): OpsCtx => ({
+    ...scriptedCtx(['{}']),
+    getAdapter: () => ({
+      chat: (): AsyncIterable<ChatChunk> => {
+        throw new Error('model unreachable');
+      },
+    }),
+  });
+
+  it('free text: error says the entry is saved in the daily file', async () => {
+    const c = collect();
+    await runContributePlan(throwingCtx(), 'a thought worth keeping', c.emit);
+    const err = c.events.find((e) => e.kind === 'error');
+    expect(err && err.kind === 'error' ? err.error : '').toMatch(/^Your entry is saved in sources\/contributors\/u\/\d{4}-\d{2}-\d{2}\.md — the wiki update failed: model unreachable$/);
+    const daily = await readFile(join(root, 'sources', 'contributors', 'u', `${new Date().toISOString().slice(0, 10)}.md`), 'utf-8');
+    expect(daily).toContain('a thought worth keeping');
+  });
+
+  it('with a caller-supplied sourcePath the plain error is kept', async () => {
+    const c = collect();
+    await runContributePlan(throwingCtx(), 'note body', c.emit, { sourcePath: 'sources/contributors/u/notes/n.md' });
+    const err = c.events.find((e) => e.kind === 'error');
+    expect(err && err.kind === 'error' ? err.error : '').toBe('model unreachable');
   });
 });

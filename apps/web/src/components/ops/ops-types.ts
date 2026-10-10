@@ -9,7 +9,8 @@ export type OpAction =
 export type FindingKind =
   | 'contradiction' | 'stale' | 'orphan' | 'missing_page'
   | 'missing_link' | 'gap' | 'question'
-  | 'unsourced_page' | 'uncited_source';
+  | 'unsourced_page' | 'uncited_source'
+  | 'broken_citation' | 'broken_link' | 'near_duplicate';
 
 export interface FindingEvidence {
   page: string;
@@ -54,6 +55,9 @@ export const FINDING_LABEL: Record<FindingKind, string> = {
   question: 'question',
   unsourced_page: 'unsourced page',
   uncited_source: 'uncited source',
+  broken_citation: 'broken citation',
+  broken_link: 'broken link',
+  near_duplicate: 'near duplicate',
 };
 
 export const FINDING_COLOR: Record<FindingKind, string> = {
@@ -66,6 +70,9 @@ export const FINDING_COLOR: Record<FindingKind, string> = {
   question: '#34a853',
   unsourced_page: '#e8a13c',
   uncited_source: '#8e8e93',
+  broken_citation: '#e8a13c',
+  broken_link: '#d9534f',
+  near_duplicate: '#8b5cf6',
 };
 
 export function actionTarget(a: OpAction): string {

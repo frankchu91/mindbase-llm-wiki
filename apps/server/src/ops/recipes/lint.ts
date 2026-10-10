@@ -17,7 +17,19 @@ export const FINDING_KINDS = [
   // Computed deterministically by the runner, never requested from the model.
   'unsourced_page',
   'uncited_source',
+  'broken_citation',
+  'broken_link',
+  'near_duplicate',
 ] as const;
+
+/** Kinds the runner computes in code; any the model emits anyway are dropped. */
+export const DETERMINISTIC_KINDS: ReadonlySet<Finding['kind']> = new Set<Finding['kind']>([
+  'unsourced_page',
+  'uncited_source',
+  'broken_citation',
+  'broken_link',
+  'near_duplicate',
+]);
 
 export const evidenceSchema = z.object({
   page: z.string().min(1),
@@ -54,8 +66,12 @@ conflicting page, with "quote" copied VERBATIM (no paraphrase, no ellipsis,
 8-300 characters) from that page. For "stale", include at least one verbatim
 quote. Findings whose quotes cannot be found verbatim in the named page will
 be discarded. Evidence is optional for other kinds.
-Do NOT emit kinds "unsourced_page" or "uncited_source" — those are computed
-deterministically from the citation data below.
+Do NOT emit kinds "unsourced_page", "uncited_source", "broken_citation",
+"broken_link" or "near_duplicate" — uncited pages/sources, broken citations,
+broken wikilinks and near-duplicate pages are all computed by the system from
+the link and citation data below. In particular, "missing_link" is ONLY for a
+one-way cross-reference between two pages that BOTH exist; never use it for a
+link whose target does not exist.
 Rules: every finding must cite the specific page paths in "pages"; detail is
 1-3 sentences, concrete, quoting the conflicting text when relevant; do not
 invent pages that were not provided; return at most 12 findings, the most

@@ -182,7 +182,7 @@ export function ChatView({ onWikiSaved, chatTitle, onNewChat, onOpenArticle, onO
           break;
         }
         case 'done':
-          finish(asstId, e.citations ?? [], e.sources);
+          finish(asstId, e.citations ?? [], e.sources, e.budget);
           setBusy(false);
           break;
         case 'error':

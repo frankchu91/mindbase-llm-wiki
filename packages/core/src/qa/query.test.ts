@@ -259,6 +259,84 @@ describe('askQuestion', () => {
   });
 });
 
+describe('askQuestion budget', () => {
+  type DoneEvent = Extract<QAEvent, { kind: 'done' }>;
+
+  async function runAsk(store: MemoryStore, idx: SearchIndex, maxSourceChars?: number): Promise<DoneEvent> {
+    const adapter = fakeAdapter([
+      [
+        { kind: 'delta', text: 'Answer [1].' },
+        { kind: 'done', usage: { input_tokens: 10, output_tokens: 5 } },
+      ],
+    ]);
+    const events: QAEvent[] = [];
+    for await (const e of askQuestion({
+      question: 'What is RAG?',
+      store,
+      index: idx,
+      adapter,
+      model: 'gpt-4o-mini',
+      maxSourceChars,
+    })) {
+      events.push(e);
+    }
+    const done = events.find((e): e is DoneEvent => e.kind === 'done');
+    if (!done) throw new Error('no done event');
+    return done;
+  }
+
+  // Tier 3 resolves raw sources via conceptMetaPath (wiki/concepts/), while
+  // seedWiki writes the meta under wiki/notes/ — mirror it so tier 3 fires.
+  async function seedRaw(store: MemoryStore, rawBody: string): Promise<void> {
+    const meta = await store.readJSON<MetaJson>('wiki/notes/rag.meta.json');
+    await store.writeJSON('wiki/concepts/rag.meta.json', meta);
+    await store.writeText('raw/2026-04-08/r1.md', rawBody);
+  }
+
+  it('reports clipped paths and sent < retrieved when a long body exceeds a small budget', async () => {
+    const store = new MemoryStore();
+    const idx = await seedWiki(store);
+    const longBody = `# RAG\n\n${'retrieval '.repeat(100)}`; // ~1000 chars
+    await store.writeText('wiki/notes/rag.md', longBody);
+
+    const done = await runAsk(store, idx, 200);
+
+    expect(done.budget.retrievedChars).toBe(longBody.length);
+    expect(done.budget.sentChars).toBe(200);
+    expect(done.budget.sentChars).toBeLessThan(done.budget.retrievedChars);
+    expect(done.budget.clipped).toEqual(['wiki/notes/rag.md']);
+  });
+
+  it('reports nothing clipped and sent === retrieved under a comfortable budget', async () => {
+    const store = new MemoryStore();
+    const idx = await seedWiki(store);
+    const rawBody = '# Raw r1\n\nShort raw source body.';
+    await seedRaw(store, rawBody);
+    const noteBody = await store.readText('wiki/notes/rag.md');
+
+    const done = await runAsk(store, idx, 50000);
+
+    expect(done.budget.retrievedChars).toBe(noteBody.length + rawBody.length);
+    expect(done.budget.sentChars).toBe(done.budget.retrievedChars);
+    expect(done.budget.clipped).toEqual([]);
+  });
+
+  it('marks a raw source as clipped when it is dropped entirely for lack of budget', async () => {
+    const store = new MemoryStore();
+    const idx = await seedWiki(store);
+    const rawBody = `# Raw r1\n\n${'x'.repeat(500)}`;
+    await seedRaw(store, rawBody);
+    const noteBody = await store.readText('wiki/notes/rag.md');
+
+    // Note fits (~60 chars) but the tier-3 raw needs usedChars + 2000 < budget.
+    const done = await runAsk(store, idx, 1000);
+
+    expect(done.budget.retrievedChars).toBe(noteBody.length + rawBody.length);
+    expect(done.budget.sentChars).toBe(noteBody.length);
+    expect(done.budget.clipped).toEqual(['raw:r1']);
+  });
+});
+
 describe('preferSources', () => {
   const research: SearchResult = { path: 'sources/research/a.md', title: 'a', type: 'concept', score: 10 };
   const contributor: SearchResult = { path: 'sources/contributors/u/n.md', title: 'n', type: 'source', score: 9 };

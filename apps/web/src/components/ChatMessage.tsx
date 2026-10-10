@@ -25,6 +25,15 @@ function injectCiteElements(text: string): string {
   return text.replace(/\[(\d+)\]/g, (_, n) => `<cite data-n="${n}"></cite>`);
 }
 
+/** 9.1k-style for >= 1000, plain number below. */
+function fmtChars(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+function basename(p: string): string {
+  return p.split('/').pop() ?? p;
+}
+
 export function ChatMessage({
   msg,
   onWikiSaved,
@@ -200,6 +209,14 @@ export function ChatMessage({
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* Retrieval budget — how much of what was retrieved the model actually saw */}
+        {msg.budget && msg.budget.retrievedChars > 0 && (
+          <div className="mt-2 text-[10.5px]" style={{ color: 'var(--text-faint)' }} data-testid="answer-budget">
+            read {msg.sources?.length ?? 0} pages · {fmtChars(msg.budget.sentChars)} of {fmtChars(msg.budget.retrievedChars)} chars fit
+            {msg.budget.clipped.length > 0 && ` · clipped: ${msg.budget.clipped.map(basename).join(', ')}`}
           </div>
         )}
 

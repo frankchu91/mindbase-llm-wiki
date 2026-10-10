@@ -15,12 +15,21 @@ export interface CitedSource {
   layer?: 'source' | 'wiki';
 }
 
+/** Mirror of @mindbase/core RetrievalBudget (type-only import boundary). */
+export interface RetrievalBudget {
+  retrievedChars: number;
+  sentChars: number;
+  clipped: string[];
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
   citations?: Citation[];
   sources?: CitedSource[];
+  /** How much of the retrieved text reached the model; absent on older messages. */
+  budget?: RetrievalBudget;
   progress?: string[]; // phases seen so far
   /** Live tail of a thinking model's reasoning stream (cleared when the answer starts). */
   thinking?: string | null;
@@ -36,7 +45,7 @@ interface ChatState {
   addProgress: (id: string, phase: string) => void;
   setThinking: (id: string, text: string | null) => void;
   setSources: (id: string, sources: CitedSource[]) => void;
-  finish: (id: string, citations: Citation[], sources?: CitedSource[]) => void;
+  finish: (id: string, citations: Citation[], sources?: CitedSource[], budget?: RetrievalBudget) => void;
   fail: (id: string, error: string) => void;
   reset: () => void;
 }
@@ -81,10 +90,10 @@ export const useChat = create<ChatState>((set) => ({
     set((s) => ({
       messages: s.messages.map((m) => (m.id === id ? { ...m, sources } : m)),
     })),
-  finish: (id, citations, sources) =>
+  finish: (id, citations, sources, budget) =>
     set((s) => ({
       messages: s.messages.map((m) =>
-        m.id === id ? { ...m, citations, sources: sources ?? m.sources, status: 'done' } : m,
+        m.id === id ? { ...m, citations, sources: sources ?? m.sources, budget: budget ?? m.budget, status: 'done' } : m,
       ),
     })),
   fail: (id, error) =>

@@ -1,11 +1,36 @@
 import { Router } from 'express';
 import { askQuestion, slugify, AUTO_SAVE_REGEX } from '@mindbase/core';
-import type { MetaJson } from '@mindbase/core';
+import type { MetaJson, QAEvent } from '@mindbase/core';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import type { ServerContext } from '../context';
 import { projectRoot as makeProjectRoot, detectLayoutVersion } from '../context';
 import { applyActions } from '../ops/executors';
+
+type DoneEvent = Extract<QAEvent, { kind: 'done' }>;
+
+/**
+ * Append one `query` line to logs/<date>.md for a completed ask so the op log
+ * records reads, not just filed answers. Best-effort: never throws.
+ */
+async function logQuery(root: string, question: string, done: DoneEvent): Promise<void> {
+  try {
+    const now = new Date();
+    const date = now.toISOString().slice(0, 10);
+    const time = now.toISOString().slice(11, 16);
+    const q = question.replace(/\s+/g, ' ').trim().slice(0, 80).replace(/"/g, "'");
+    const { sentChars, retrievedChars } = done.budget;
+    // `sources` = pages placed in the prompt; `citations` = the subset the
+    // answer actually pointed at. Both matter: read-but-uncited is the
+    // signal that retrieval found it and the model ignored it.
+    const read = done.sources.slice(0, 6).map((c) => c.path).join(', ');
+    const tail = read ? ` read: ${read}` : '';
+    const line = `## [${date} ${time}] query | "${q}" read=${done.sources.length} cited=${done.citations.length} sent=${sentChars}/${retrievedChars} chars${tail}\n`;
+    const logFile = join(root, 'logs', `${date}.md`);
+    await mkdir(dirname(logFile), { recursive: true });
+    await appendFile(logFile, line, 'utf-8');
+  } catch { /* logging must never break the answer */ }
+}
 
 export function askRoutes(ctx: ServerContext): Router {
   const router = Router();
@@ -42,6 +67,8 @@ export function askRoutes(ctx: ServerContext): Router {
         res.write(`data: ${JSON.stringify(event)}\n\n`);
         if (event.kind === 'delta') {
           fullText += event.text;
+        } else if (event.kind === 'done') {
+          await logQuery(makeProjectRoot(ctx.dataDir, ctx.currentProjectId), question, event);
         }
       }
 

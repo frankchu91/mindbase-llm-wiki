@@ -9,13 +9,14 @@ import { randomUUID } from 'node:crypto';
 import { applyActions } from './executors';
 import { completeJson, OpLlmError, type LlmCtx } from './llm';
 import {
-  gatherProjectCore, gatherResearchPages, gatherSourceStats, gatherUnbuiltSources, listResearchSlugs,
+  findMissingFiles, gatherProjectCore, gatherResearchPages, gatherSourceStats, gatherUnbuiltSources,
+  listNoteSlugs, listResearchSlugs, parseCitations,
   type ResearchPage, type SourceStat,
 } from './gather';
 import { appendDailyEntry } from '../lib/daily-entry';
 import { contributePrompt, contributePlanSchema, type RelatedPage } from './recipes/contribute';
 import { buildPrompt, buildSchema } from './recipes/build';
-import { lintPrompt, lintSchema, type Finding } from './recipes/lint';
+import { DETERMINISTIC_KINDS, lintPrompt, lintSchema, type Finding } from './recipes/lint';
 import { researchPrompt, researchSchema, type ResearchSource } from './recipes/research';
 import { braveSearchSources } from './web-search';
 import type { Action } from './types';
@@ -186,11 +187,16 @@ export async function runContributePlan(
   emit: (e: OpEvent) => void,
   opts: { sourcePath?: string } = {},
 ): Promise<void> {
+  // Set once THIS call has appended the entry to the daily file. If the plan
+  // then fails, the user must learn their text is safe — the source layer
+  // succeeded and only the wiki update did not (fail-open).
+  let savedEntry: string | undefined;
   try {
     let sourcePath = opts.sourcePath;
     if (!sourcePath) {
       emit({ kind: 'phase', phase: "saving to today's log" });
       sourcePath = (await appendDailyEntry(ctx.projectRoot, ctx.user, text)).file;
+      savedEntry = sourcePath;
     }
     emit({ kind: 'phase', phase: 'reading project' });
     const [core, existingSlugs] = await Promise.all([gatherProjectCore(ctx.projectRoot), listResearchSlugs(ctx.projectRoot)]);
@@ -227,7 +233,11 @@ export async function runContributePlan(
     });
     emit({ kind: 'done' });
   } catch (e) {
-    emit({ kind: 'error', error: errText(e) });
+    const message = errText(e);
+    emit({
+      kind: 'error',
+      error: savedEntry ? `Your entry is saved in ${savedEntry} — the wiki update failed: ${message}` : message,
+    });
   }
 }
 
@@ -385,38 +395,138 @@ export async function verifyEvidence(
 }
 
 const MAX_DETERMINISTIC_PER_KIND = 8;
+const MAX_NEAR_DUPLICATE_PAIRS = 5;
+const NEAR_DUPLICATE_MIN_JACCARD = 0.6;
+const NEAR_DUPLICATE_MIN_SHARED = 2;
+const SLUG_STOPWORDS = new Set(['the', 'a', 'an', 'of', 'and', 'in', 'for', 'to', 'vs', 'on', 'with']);
 
 /**
- * Findings computed from citation data without the model: research pages
- * that cite nothing, and sources that were built over (older than
- * context.md) yet never cited anywhere. Skips `uncited_source` entirely when
- * there is no context.md to compare against.
+ * Content tokens of a slug: split on `-`, drop stopwords/empties, and fold a
+ * trailing plural `s` so `cost` ≡ `costs`. Deliberately crude — it only has
+ * to make two slugs about the same concept look alike.
  */
-function deterministicFindings(pages: ResearchPage[], sources: SourceStat[], contextMtimeMs: number | null): StoredFinding[] {
+export function slugTokens(slug: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of normalizeSlug(slug).split('-')) {
+    if (!raw || SLUG_STOPWORDS.has(raw)) continue;
+    out.add(raw.length > 3 && raw.endsWith('s') && !raw.endsWith('ss') ? raw.slice(0, -1) : raw);
+  }
+  return out;
+}
+
+function jaccard(a: Set<string>, b: Set<string>): { score: number; shared: number } {
+  let shared = 0;
+  for (const t of a) if (b.has(t)) shared += 1;
+  const union = a.size + b.size - shared;
+  return { score: union === 0 ? 0 : shared / union, shared };
+}
+
+/**
+ * Greedy pairing of pages whose slug token sets overlap heavily: highest
+ * Jaccard first, each page in at most one pair, capped. Exported for tests.
+ */
+export function nearDuplicatePairs(pages: ResearchPage[]): Array<{ a: ResearchPage; b: ResearchPage; score: number }> {
+  const tokens = pages.map((p) => slugTokens(p.slug));
+  const candidates: Array<{ i: number; j: number; score: number }> = [];
+  for (let i = 0; i < pages.length; i++) {
+    for (let j = i + 1; j < pages.length; j++) {
+      const { score, shared } = jaccard(tokens[i]!, tokens[j]!);
+      if (score >= NEAR_DUPLICATE_MIN_JACCARD && shared >= NEAR_DUPLICATE_MIN_SHARED) candidates.push({ i, j, score });
+    }
+  }
+  candidates.sort((x, y) => y.score - x.score || x.i - y.i || x.j - y.j);
+  const used = new Set<number>();
+  const pairs: Array<{ a: ResearchPage; b: ResearchPage; score: number }> = [];
+  for (const c of candidates) {
+    if (pairs.length >= MAX_NEAR_DUPLICATE_PAIRS) break;
+    if (used.has(c.i) || used.has(c.j)) continue;
+    used.add(c.i);
+    used.add(c.j);
+    pairs.push({ a: pages[c.i]!, b: pages[c.j]!, score: c.score });
+  }
+  return pairs;
+}
+
+export interface DeterministicInput {
+  pages: ResearchPage[];
+  sources: SourceStat[];
+  /** mtime of context.md, or null when it does not exist. */
+  contextMtimeMs: number | null;
+  /** `[@path]` citations found in context.md. */
+  contextCites: string[];
+  /** Cited paths (from pages + context.md) that are not files on disk. */
+  missingPaths: ReadonlySet<string>;
+  /** Normalized slugs of every research page and contributor note — valid `[[wikilink]]` targets. */
+  linkTargets: ReadonlySet<string>;
+}
+
+const finding = (kind: Finding['kind'], pages: string[], detail: string): StoredFinding => ({
+  kind, pages, detail, id: randomUUID(), dismissed: false,
+});
+
+/**
+ * Findings computed from link/citation data without the model, in this
+ * order: research pages that cite nothing; sources that were built over
+ * (older than context.md) yet never cited anywhere (skipped entirely when
+ * there is no context.md); citations whose file is gone; wikilinks whose
+ * target page/note does not exist; pairs of pages whose slugs name the same
+ * concept. Pure and synchronous — all fs facts arrive precomputed.
+ */
+export function deterministicFindings(input: DeterministicInput): StoredFinding[] {
+  const { pages, sources, contextMtimeMs, contextCites, missingPaths, linkTargets } = input;
   const unsourced = pages
     .filter((p) => p.cites.length === 0)
     .slice(0, MAX_DETERMINISTIC_PER_KIND)
-    .map<StoredFinding>((p) => ({
-      kind: 'unsourced_page',
-      pages: [p.path],
-      detail: 'This research page cites no source (no [@path] citations). Add the sources it was synthesized from.',
-      id: randomUUID(),
-      dismissed: false,
-    }));
+    .map((p) => finding(
+      'unsourced_page',
+      [p.path],
+      'This research page cites no source (no [@path] citations). Add the sources it was synthesized from.',
+    ));
   const uncited = contextMtimeMs === null
     ? []
     : sources
       .filter((s) => s.citedBy === 0 && s.mtimeMs < contextMtimeMs)
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
       .slice(0, MAX_DETERMINISTIC_PER_KIND)
-      .map<StoredFinding>((s) => ({
-        kind: 'uncited_source',
-        pages: [s.path],
-        detail: 'Built over but never cited by any research page or context.md.',
-        id: randomUUID(),
-        dismissed: false,
-      }));
-  return [...unsourced, ...uncited];
+      .map((s) => finding('uncited_source', [s.path], 'Built over but never cited by any research page or context.md.'));
+
+  const brokenCitations: StoredFinding[] = [];
+  const citers: Array<{ page: string; cites: string[] }> = [
+    ...pages.map((p) => ({ page: p.path, cites: p.cites })),
+    { page: 'context.md', cites: contextCites },
+  ];
+  outer: for (const { page, cites } of citers) {
+    for (const path of cites) {
+      if (!missingPaths.has(path)) continue;
+      brokenCitations.push(finding(
+        'broken_citation',
+        [page],
+        `Cites [@${path}] but that file no longer exists (moved or deleted). Update the citation.`,
+      ));
+      if (brokenCitations.length >= MAX_DETERMINISTIC_PER_KIND) break outer;
+    }
+  }
+
+  const brokenLinks: StoredFinding[] = [];
+  outer2: for (const p of pages) {
+    for (const target of p.outbound) {
+      if (linkTargets.has(normalizeSlug(target))) continue;
+      brokenLinks.push(finding(
+        'broken_link',
+        [p.path],
+        `Links to [[${target}]] but no page or note with that name exists. Create it or fix the link.`,
+      ));
+      if (brokenLinks.length >= MAX_DETERMINISTIC_PER_KIND) break outer2;
+    }
+  }
+
+  const nearDuplicates = nearDuplicatePairs(pages).map(({ a, b }) => finding(
+    'near_duplicate',
+    [a.path, b.path],
+    `"${a.slug}" and "${b.slug}" look like the same concept. Extend one page instead of keeping both.`,
+  ));
+
+  return [...unsourced, ...uncited, ...brokenCitations, ...brokenLinks, ...nearDuplicates];
 }
 
 const lintDir = (root: string) => join(root, 'artifacts', 'lint');
@@ -457,7 +567,14 @@ export async function runLint(ctx: OpsCtx, emit: (e: OpEvent) => void): Promise<
       emit({ kind: 'error', error: 'Nothing to lint yet — contribute a thought or two first.' });
       return;
     }
-    const sources = await gatherSourceStats(ctx.projectRoot, pages);
+    const contextCites = parseCitations(core.context);
+    const [sources, missingPaths, researchSlugs, noteSlugs] = await Promise.all([
+      gatherSourceStats(ctx.projectRoot, pages),
+      findMissingFiles(ctx.projectRoot, [...pages.flatMap((p) => p.cites), ...contextCites]),
+      listResearchSlugs(ctx.projectRoot),
+      listNoteSlugs(ctx.projectRoot),
+    ]);
+    const linkTargets = new Set([...researchSlugs, ...noteSlugs].map(normalizeSlug));
     emit({ kind: 'phase', phase: `checking ${pages.length} pages with ${ctx.config.model}` });
     const { system, user } = lintPrompt({ core, pages, sources });
     const out = await completeJson(ctx, { system, user, schema: lintSchema, maxTokens: 4096 });
@@ -466,7 +583,7 @@ export async function runLint(ctx: OpsCtx, emit: (e: OpEvent) => void): Promise<
     // The model is told not to emit deterministic kinds; drop any it sends
     // so they never bypass the code-computed versions below.
     const modelFindings = out.findings
-      .filter((f) => f.kind !== 'unsourced_page' && f.kind !== 'uncited_source')
+      .filter((f) => !DETERMINISTIC_KINDS.has(f.kind))
       .map((f) => ({
         ...f,
         // Models sometimes echo path labels with different casing/prefixes;
@@ -477,7 +594,10 @@ export async function runLint(ctx: OpsCtx, emit: (e: OpEvent) => void): Promise<
       }));
     emit({ kind: 'phase', phase: 'verifying evidence' });
     const { kept, dropped } = await verifyEvidence(ctx.projectRoot, modelFindings);
-    const findings: StoredFinding[] = [...kept, ...deterministicFindings(pages, sources, contextMtimeMs)];
+    const findings: StoredFinding[] = [
+      ...kept,
+      ...deterministicFindings({ pages, sources, contextMtimeMs, contextCites, missingPaths, linkTargets }),
+    ];
     const artifact: LintArtifact = { date, findings, dropped };
     await mkdir(lintDir(ctx.projectRoot), { recursive: true });
     await writeFile(join(lintDir(ctx.projectRoot), `${date}.json`), JSON.stringify(artifact, null, 2), 'utf-8');
